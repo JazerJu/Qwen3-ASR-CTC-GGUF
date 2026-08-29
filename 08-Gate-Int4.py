@@ -19,7 +19,10 @@ import soundfile as sf
 
 from qwen3_compat import valid_frames
 
-QWEN3_DIR = "/data/推理框架/asr-onnx/Qwen3-ASR-HF"
+sys.path.insert(0, str(HERE))
+import export_config as C  # noqa: E402
+
+QWEN3_DIR = str(C.QWEN3_DIR)
 BLANK, UNK = 72466, 72467
 
 

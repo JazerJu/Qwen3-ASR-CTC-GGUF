@@ -25,7 +25,10 @@ from transformers import WhisperFeatureExtractor
 from modeling_ctc import patch_qwen3_attention_mask
 from qwen3_compat import repair_positional_embedding, valid_frames
 
-QWEN3_DIR = "/data/推理框架/asr-onnx/Qwen3-ASR-HF"
+sys.path.insert(0, str(HERE))
+import export_config as C  # noqa: E402
+
+QWEN3_DIR = str(C.QWEN3_DIR)
 MEL_FRAMES = 3000
 
 FE = WhisperFeatureExtractor.from_pretrained(QWEN3_DIR)

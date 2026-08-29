@@ -1,7 +1,18 @@
+# 模型产物（体积大，走 Releases / HF，不进 git）
 model/*.onnx
+model/*.onnx.data
 model/*.gguf
-ctc_head.safetensors
+ctc/
 hf/
+
+# 运行产物
+*.srt
+!input.srt
+logs/
+*.log
+
+# python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
+venv/

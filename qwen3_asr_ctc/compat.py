@@ -8,9 +8,13 @@ Import this BEFORE `from qwen_asr import Qwen3ASRModel`:
      pre-seed the attributes via object.__setattr__ so the hook finds them.
 """
 
+import os
 import sys
 
-sys.path.insert(0, "/data/其他模型/ASR模型/Qwen3-ASR")
+# qwen_asr 包的源码位置（pip 装的话不需要）。机器不同就设 QWEN_ASR_SRC。
+_src = os.environ.get("QWEN_ASR_SRC", "/data/其他模型/ASR模型/Qwen3-ASR")
+if _src and os.path.isdir(_src) and _src not in sys.path:
+    sys.path.insert(0, _src)
 
 import torch
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS

@@ -50,7 +50,9 @@ def cosine_gate(fp32: Path, opt: Path, feeds: dict) -> bool:
 
 
 def main() -> int:
-    here = Path(__file__).resolve().parent / "model"
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import export_config as C
+    here = C.MODEL_DIR
     p = argparse.ArgumentParser()
     p.add_argument("--opt-level", type=int, default=1)
     p.add_argument("--skip-encoder", action="store_true")

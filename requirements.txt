@@ -1,0 +1,13 @@
+# ==================== 推理依赖 ====================
+onnxruntime            # CPU；GPU 换成 onnxruntime-gpu 或 onnxruntime-directml
+numpy
+soundfile
+transformers>=4.51     # 只用 WhisperFeatureExtractor（特征）与 tokenizer
+# ffmpeg 需要系统安装：https://ffmpeg.org/download.html
+
+# ==================== 导出依赖（跑 01-05 才需要）====================
+torch>=2.4
+onnx
+safetensors
+qwen-asr==0.0.6        # 编码器结构；见 qwen3_asr_ctc/compat.py 的补丁说明
+# llama.cpp 需另行编译，供第 4、5 步使用：https://github.com/ggml-org/llama.cpp
