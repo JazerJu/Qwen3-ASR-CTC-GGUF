@@ -1,0 +1,7 @@
+model/*.onnx
+model/*.gguf
+ctc_head.safetensors
+hf/
+__pycache__/
+*.pyc
+.venv/
