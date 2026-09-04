@@ -78,7 +78,7 @@ python 08-Gate-Int4.py               # int4 链 vs fp32 链，贪心文本差异
 
 默认两遍：CTC 首遍出词级时间戳和热词候选，LLM 二遍（q5_k_m GGUF）出最终文本，再用 NW 把 CTC 的时间戳对到 LLM 文本上。不给 `decoder_gguf_path` 就只跑 CTC 首遍。
 
-**精度怎么选**：N 卡走 CUDA EP 用 **fp16**——q4 的 `MatMulNBits` 是给 DirectML / 核显省显存的，在 CUDA EP 上反而比 fp16 慢一倍（5070 Ti 上 encoder 21.8 vs 10.1ms）。q4 留给 Windows DML 和显存紧的机器。CTC 头加载时会在图末尾追加 ArgMax，只回传帧级 id（省掉 30 秒 113MB 的 logits 回传，19 → 8ms），`ctc_argmax_in_graph=False` 可关。
+**精度怎么选**：N 卡走 CUDA EP 用 **fp16**——q4 的 `MatMulNBits` 是给 DirectML / 核显省显存的，在 CUDA EP 上反而比 fp16 慢一倍（5070 Ti 上 encoder 21.8 vs 10.1ms）。显存紧的 N 卡用 **q4f16**（int4 权重 + fp16 激活，`03-Quantize-ONNX.py` 顺带产出）：速度和 fp16 一样（encoder 10.6 vs 10.1ms），体积只有 1/4（164MB vs 606MB），CTC 帧级输出与 q4 完全一致。原来的 q4（fp32 激活）只剩 CPU EP 一个用处；Windows DML 跑不了 `MatMulNBits`，只能用 fp16。CTC 头加载时会在图末尾追加 ArgMax，只回传帧级 id（省掉 30 秒 113MB 的 logits 回传，19 → 8ms），`ctc_argmax_in_graph=False` 可关。
 
 ```python
 from qwen3_asr_ctc import create_asr_engine

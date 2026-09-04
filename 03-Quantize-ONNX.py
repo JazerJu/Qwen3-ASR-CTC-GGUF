@@ -103,12 +103,32 @@ def to_fp16(src: Path, dst: Path):
     print(f"  fp16 {dst.name}: {dst.stat().st_size/2**20:.1f} MiB")
 
 
+def to_q4f16(q4: Path, dst: Path):
+    """int4 权重 + fp16 激活，给显存紧的 N 卡。
+
+    q4 是从 fp32 图量化的，MatMulNBits 的激活是 fp32，CUDA EP 上走不带 tensor core 的 fp32 GEMM，
+    比 fp16 慢一倍（5070 Ti 上 Qwen encoder 21.9 vs 9.7ms，GLM 105 vs 50ms）。MatMulNBits 本身不慢
+    ——单算子 A=fp16 时 2.81ms，fp16 MatMul 2.77ms。把激活和 scale 转成 fp16，速度就和 fp16 一样，
+    体积约 fp16 的 1/4，帧级 CTC 输出与 q4 完全一致。DML 跑不了 MatMulNBits，那边仍用 fp16。
+    """
+    model = onnx.load(str(q4))
+    m16 = convert_float_to_float16(
+        model, keep_io_types=True,
+        min_positive_val=1e-7, max_finite_val=65504,
+        disable_shape_infer=True,   # 不 block LayerNormalization：和 disable_shape_infer 一起用会让 LN 的输入/权重类型不一致，CUDA 的 fp16 LN 内部本就 fp32 累加
+    )
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    onnx.save(m16, str(dst))
+    print(f"  q4f16 {dst.name}: {dst.stat().st_size/2**20:.1f} MiB")
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--block-size", type=int, default=128)
     p.add_argument("--symmetric", action="store_true")
     p.add_argument("--skip-int4", action="store_true")
     p.add_argument("--skip-fp16", action="store_true")
+    p.add_argument("--skip-q4f16", action="store_true")
     args = p.parse_args()
 
     for stem in ("Qwen3-ASR-CTC", "Qwen3-ASR-Encoder"):
@@ -121,6 +141,8 @@ def main() -> int:
             quant_int4(fp32, MODEL / f"{stem}.q4.onnx", args.block_size, args.symmetric)
         if not args.skip_fp16:
             to_fp16(fp32, MODEL / f"{stem}.fp16.onnx")
+        if not args.skip_q4f16 and (MODEL / f"{stem}.q4.onnx").exists():
+            to_q4f16(MODEL / f"{stem}.q4.onnx", MODEL / f"{stem}.q4f16.onnx")
     return 0
 
 
