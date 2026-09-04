@@ -76,6 +76,8 @@ python 08-Gate-Int4.py               # int4 链 vs fp32 链，贪心文本差异
 
 ### 4. 运行识别
 
+默认两遍：CTC 首遍出词级时间戳和热词候选，LLM 二遍（q5_k_m GGUF）出最终文本，再用 NW 把 CTC 的时间戳对到 LLM 文本上。不给 `decoder_gguf_path` 就只跑 CTC 首遍。
+
 ```python
 from qwen3_asr_ctc import create_asr_engine
 
@@ -84,35 +86,62 @@ engine = create_asr_engine(
     ctc_onnx_path="model/Qwen3-ASR-CTC.q4.onnx",
     tokens_path="model/tokens.txt",
     preprocessor_path="preprocessor",
+    decoder_gguf_path="model/Qwen3-ASR-Decoder.q5_k_m.gguf",   # 去掉这行就是纯 CTC
+    hotwords=["Claude Code", "科大讯飞"],                        # 可选：CTC 首遍音素匹配到的热词会进 prompt
 )
 
 result = engine.transcribe("input.mp3")
-print(result.text)                    # 识别文本
+print(result.text)                    # LLM 二遍文本（纯 CTC 模式下 = CTC 文本）
+print(result.ctc_text)                # CTC 首遍文本
+print(result.hotwords)                # 这段音频里匹配到、进了 prompt 的热词
 print(result.words)                   # [(词, 起秒, 止秒)]
 print(f"RTF {result.rtf:.3f}")
 ```
+
+命令行：
+
+```bash
+python 06-Inference.py input.mp3                          # 两遍
+python 06-Inference.py clip.wav --srt out.srt --hotwords hot.txt
+python 06-Inference.py clip.wav --no-decoder              # 只 CTC
+```
+
+流式接口和 CapsWriter / Fun-ASR-GGUF 同形：`create_stream()` → `accept_waveform(16000, wav)` → `decode_stream(stream, context=..., language=...)`，结果在 `stream.result.text / tokens / timestamps`，返回的 `DecodeResult.timings` 有 encode / ctc / inject / llm_generate / align 各段耗时。
 
 ---
 
 ## 工作原理
 
 ```
-音频输入（任意格式，ffmpeg 转 16 kHz 单声道）
+音频输入（任意格式，ffmpeg 转 16 kHz 单声道；超过 30 秒按 30 秒切段）
     ↓
   mel 特征 128×T   ——  不补到 30 秒，取真实长度后零填到 3000 帧桶
     ↓
 ┌──────────────────────────────────────────────────┐
 │  Encoder (ONNX)   30 秒桶 + feature_length 标量    │
-│                   -> 每 100 mel 帧出 13 帧         │
-│  CTC 头 (ONNX)    -> 逐帧 logits                  │
-└──────────────────────────────────────────────────┘
-    ↓                      ↓
-  贪心折叠 + 字节反解      帧位置 -> 时间戳（减常数偏置）
-    ↓                      ↓
-   识别文本               词级时间戳 / SRT
+│                   -> 每 100 mel 帧出 13 帧         │  ──┐
+│  CTC 头 (ONNX)    -> 逐帧 logits -> argmax         │    │ 音频 embedding [T, 2048]
+└──────────────────────────────────────────────────┘    │
+    ↓                      ↓                            │
+  贪心折叠 + 字节反解      帧位置 -> 起始秒（减常数偏置）    │
+    ↓                                                   │
+  CTC 首遍文本 ──► 音素热词匹配（PhonemeCorrector）         │
+    │                      ↓ 命中的热词                  │
+    │   ┌──────────────────────────────────────────────┐ │
+    │   │ LLM 二遍 (llama.cpp, q5_k_m GGUF)             │◄┘
+    │   │ ChatML：system(热词/上下文) user(<|audio_start|> │
+    │   │ embedding <|audio_end|>) assistant <asr_text>  │
+    │   │ 4 段 M-RoPE 位置 [pos,pos,pos,0]                │
+    │   └──────────────────────────────────────────────┘
+    │                      ↓ 最终文本
+    └──► NW 对齐（CTC 字符时间戳 -> LLM 文本，逐行向量化）
+                           ↓
+                 识别文本 + 词级时间戳 / SRT
 ```
 
-LLM 二遍（q5_k_m GGUF）已导出并可加载，尚未接进 `06-Inference.py`。
+CTC 首遍文本本身不改（热词只出候选进 prompt，LLM 从音频 embedding 重新生成，不消费 CTC 文本），它只做两件事：给热词匹配当输入，给时间戳对齐当锚点。
+
+加载顺序有硬约束：**llama.cpp 要先于 ONNX Runtime CUDA 初始化**，反过来同进程 SIGSEGV（Fun-ASR-GGUF 也有同样的记录），`Qwen3ASREngine` 已按这个顺序写。停止符用 `<|im_end|>` / `<|endoftext|>`，不能用 GGUF 元数据里的 eos——这份 GGUF 的 eos 被标成了 11（英文逗号），拿它当停止符会在第一个 "," 处截断。
 
 ---
 

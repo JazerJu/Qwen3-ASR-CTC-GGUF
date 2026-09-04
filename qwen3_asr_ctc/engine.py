@@ -1,13 +1,17 @@
-"""ONNX 运行时引擎：mel -> 编码器 -> CTC -> 字节反解 -> 文本 + 词级时间戳。
+"""运行时引擎。
+
+两层：
+  * `Qwen3CtcEngine` —— mel -> 编码器 -> CTC -> 字节反解，CTC 首遍 + 词级时间戳。
+  * `Qwen3ASREngine` —— 在上面套 LLM 二遍（q5_k_m GGUF，llama.cpp）+ 音素热词 +
+    NW 时间戳对齐；不给 `decoder_gguf_path` 就退化成纯 CTC。
 
 三个必须照做、否则静默出错的点（详见 README「四个坑」）：
 
 1. **特征不补到 30 秒**：`padding=False` 取真实长度，再自己零填到导出时的
-   3000 帧桶，并把真实帧数作为 `feature_length` 传进去。用 extractor 自带的
-   30 秒补齐会让 `feature_length` 对不上。
+   3000 帧桶，并把真实帧数作为 `feature_length` 传进去。
 2. **帧率 13 fps**：有效输出帧数 = `full*13 + ceil(leave/8)`，不是 `T/8`。
-   算错会把 logits 截断，转写被腰斩且不报错。
 3. **反解走字节**：见 tokens.py。
+第四个是加载顺序：**llama.cpp 要先于 ONNX Runtime CUDA 初始化**，反过来 SIGSEGV。
 """
 from __future__ import annotations
 
@@ -17,13 +21,16 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Optional
 
+from .schema import DecodeResult, RecognitionStream
 from .tokens import decode_bytes, load_tokens
 
 FRAME_SEC = 1.0 / 13.0
 # CTC 尖峰式发射的系统性偏置，对 MFA 词级真值实测（v1：起点晚 100ms、终点早 78.5ms）
 DEFAULT_START_BIAS = 0.100
 DEFAULT_END_BIAS = 0.0785
+SEGMENT_SEC = 30.0   # 编码器按 30 秒桶导出，更长的文件按 30 秒切段
 
 
 @dataclass
@@ -38,6 +45,19 @@ class ASREngineConfig:
     use_gpu: bool = True
     start_bias: float = DEFAULT_START_BIAS
     end_bias: float = DEFAULT_END_BIAS
+    # ---- LLM 二遍（可选）----
+    decoder_gguf_path: Optional[str] = None
+    enable_ctc: bool = True           # False = 纯 decoder（不出热词、时间戳），对应 CapsWriter 的 'qwen_asr'
+    llm_use_gpu: bool = True
+    n_ctx: int = 4096
+    n_ubatch: int = 512
+    n_threads: Optional[int] = None
+    n_predict: int = 256
+    # ---- 热词 ----
+    hotwords: List[str] = field(default_factory=list)
+    similar_threshold: float = 0.72   # 进 prompt 的门槛
+    replace_threshold: float = 0.85   # 直接替换的门槛（CTC 文本本身不改，只出候选）
+    max_hotwords: int = 10
 
 
 @dataclass
@@ -46,6 +66,8 @@ class ASRResult:
     words: list = field(default_factory=list)   # [(词, 起秒, 止秒)]
     duration: float = 0.0
     elapsed: float = 0.0
+    ctc_text: str = ""
+    hotwords: list = field(default_factory=list)
 
     @property
     def rtf(self) -> float:
@@ -53,6 +75,8 @@ class ASRResult:
 
 
 class Qwen3CtcEngine:
+    FRAME_SEC = FRAME_SEC
+
     def __init__(self, config: ASREngineConfig):
         self.cfg = config
         self._np = None
@@ -81,7 +105,8 @@ class Qwen3CtcEngine:
         full, leave = divmod(mel_len, 100)
         return full * 13 + (0 if leave == 0 else (leave - 1) // 8 + 1)
 
-    def _frames(self, audio):
+    def encode(self, audio):
+        """16 kHz 波形 -> 音频 embedding [valid, 2048]（也就是喂给 LLM 的那份）。"""
         np = self._np
         mel = self._fe(audio, sampling_rate=16000, padding=False,
                        return_tensors="np").input_features[0]
@@ -90,10 +115,13 @@ class Qwen3CtcEngine:
         padded[:, :t] = mel
         enc = self._enc.run(None, {"input_features": padded,
                                    "feature_length": np.array([t], np.int64)})[0]
-        logits = self._ctc.run(
-            None, {"enc_output": enc[: self._valid_frames(t)][None].astype(np.float32)})[0]
-        ids = np.argmax(logits[0], axis=-1)
+        return enc[: self._valid_frames(t)].astype(np.float32)
 
+    def ctc_tokens(self, audio_embd):
+        """embedding -> [(紧凑 id, 帧)]，贪心折叠、去 blank/unk。"""
+        np = self._np
+        logits = self._ctc.run(None, {"enc_output": audio_embd[None]})[0]
+        ids = np.argmax(logits[0], axis=-1)
         out, prev = [], None
         for frame, tok in enumerate(ids):
             tok = int(tok)
@@ -103,6 +131,9 @@ class Qwen3CtcEngine:
             if tok not in (self.cfg.blank_id, self.cfg.unk_id):
                 out.append((tok, frame))
         return out
+
+    def _frames(self, audio):
+        return self.ctc_tokens(self.encode(audio))
 
     def _words(self, tokens):
         """CJK 一字一词，拉丁串按空白合并成词；减掉 CTC 的常数偏置。"""
@@ -147,8 +178,9 @@ class Qwen3CtcEngine:
         t0 = time.perf_counter()
         tokens = self._frames(wav)
         elapsed = time.perf_counter() - t0
-        return ASRResult(text=decode_bytes(self.id2bytes, [t for t, _ in tokens]),
-                         words=self._words(tokens), duration=duration, elapsed=elapsed)
+        text = decode_bytes(self.id2bytes, [t for t, _ in tokens])
+        return ASRResult(text=text, words=self._words(tokens), duration=duration,
+                         elapsed=elapsed, ctc_text=text)
 
     @staticmethod
     def _read_any(src: Path):
@@ -161,6 +193,62 @@ class Qwen3CtcEngine:
         return wav, sr
 
 
-def create_asr_engine(**kwargs) -> Qwen3CtcEngine:
-    """便捷构造：参数同 ASREngineConfig，返回已 initialize 的引擎。"""
-    return Qwen3CtcEngine(ASREngineConfig(**kwargs)).initialize()
+class Qwen3ASREngine:
+    """CTC 首遍 + 可选 LLM 二遍。接口对齐 GLM-ASR-CTC-GGUF 的 GLMASREngine：
+    create_stream / decode_stream / transcribe / update_hotwords / cleanup。"""
+
+    def __init__(self, config: ASREngineConfig):
+        from .pipeline import Qwen3Pipeline
+
+        self.config = config
+        self.ctc = Qwen3CtcEngine(config)
+        self.pipeline = Qwen3Pipeline(self.ctc, config)
+        if config.decoder_gguf_path:
+            self.pipeline.load_llm()          # 先 llama
+        self.ctc.initialize()                 # 后 ORT CUDA —— 顺序不能反
+        self.create_stream = lambda **_: RecognitionStream()
+        self.decode_stream = self.pipeline.decode_stream
+
+    @property
+    def has_decoder(self) -> bool:
+        return self.pipeline.model is not None
+
+    def update_hotwords(self, hotwords: List[str]):
+        self.pipeline.update_hotwords(hotwords)
+
+    def transcribe(self, audio, sample_rate: int | None = None, language: Optional[str] = None,
+                   context: Optional[str] = None, **kw) -> ASRResult:
+        """文件或波形；超过 30 秒按 30 秒切段（编码器是 30 秒桶），时间戳按段偏移。"""
+        if isinstance(audio, (str, Path)):
+            wav, sr = Qwen3CtcEngine._read_any(Path(audio))
+        else:
+            wav, sr = audio, sample_rate or 16000
+        duration = len(wav) / sr
+        seg = int(SEGMENT_SEC * sr)
+        t0 = time.perf_counter()
+        texts, words, ctc_texts, hotwords = [], [], [], []
+        for i, s in enumerate(range(0, len(wav), seg)):
+            stream = RecognitionStream(sample_rate=sr)
+            stream.accept_waveform(sr, wav[s:s + seg])
+            r: DecodeResult = self.decode_stream(stream, language=language, context=context,
+                                                 timestamp_offset=i * SEGMENT_SEC, **kw)
+            texts.append(r.text)
+            ctc_texts.append(r.ctc_text)
+            hotwords += [h for h in r.hotwords if h not in hotwords]
+            for k, (tok, st) in enumerate(r.aligned):
+                nxt = r.aligned[k + 1][1] if k + 1 < len(r.aligned) else st + FRAME_SEC
+                words.append((tok, float(st), float(max(nxt, st))))
+        elapsed = time.perf_counter() - t0
+        return ASRResult(text="".join(texts), words=words, duration=duration, elapsed=elapsed,
+                         ctc_text="".join(ctc_texts), hotwords=hotwords)
+
+    def cleanup(self):
+        self.pipeline.ctx = None
+        self.pipeline.model = None
+        self.ctc._enc = self.ctc._ctc = None
+
+
+def create_asr_engine(**kwargs) -> Qwen3ASREngine:
+    """便捷构造：参数同 ASREngineConfig，返回已初始化的引擎。
+    给 decoder_gguf_path 就是两遍，不给就是纯 CTC。"""
+    return Qwen3ASREngine(ASREngineConfig(**kwargs))
