@@ -78,12 +78,14 @@ python 08-Gate-Int4.py               # int4 链 vs fp32 链，贪心文本差异
 
 默认两遍：CTC 首遍出词级时间戳和热词候选，LLM 二遍（q5_k_m GGUF）出最终文本，再用 NW 把 CTC 的时间戳对到 LLM 文本上。不给 `decoder_gguf_path` 就只跑 CTC 首遍。
 
+**精度怎么选**：N 卡走 CUDA EP 用 **fp16**——q4 的 `MatMulNBits` 是给 DirectML / 核显省显存的，在 CUDA EP 上反而比 fp16 慢一倍（5070 Ti 上 encoder 21.8 vs 10.1ms）。q4 留给 Windows DML 和显存紧的机器。CTC 头加载时会在图末尾追加 ArgMax，只回传帧级 id（省掉 30 秒 113MB 的 logits 回传，19 → 8ms），`ctc_argmax_in_graph=False` 可关。
+
 ```python
 from qwen3_asr_ctc import create_asr_engine
 
 engine = create_asr_engine(
-    encoder_onnx_path="model/Qwen3-ASR-Encoder.q4.onnx",
-    ctc_onnx_path="model/Qwen3-ASR-CTC.q4.onnx",
+    encoder_onnx_path="model/Qwen3-ASR-Encoder.fp16.onnx",   # CUDA 用 fp16；DML/核显用 q4
+    ctc_onnx_path="model/Qwen3-ASR-CTC.fp16.onnx",
     tokens_path="model/tokens.txt",
     preprocessor_path="preprocessor",
     decoder_gguf_path="model/Qwen3-ASR-Decoder.q5_k_m.gguf",   # 去掉这行就是纯 CTC

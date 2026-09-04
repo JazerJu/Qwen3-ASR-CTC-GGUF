@@ -43,6 +43,7 @@ class ASREngineConfig:
     unk_id: int = 72467
     mel_frames: int = 3000
     use_gpu: bool = True
+    ctc_argmax_in_graph: bool = True   # 加载时给 CTC 头追加 ArgMax，只回传 int64 帧级 id（见 _ctc_session）
     start_bias: float = DEFAULT_START_BIAS
     end_bias: float = DEFAULT_END_BIAS
     # ---- LLM 二遍（可选）----
@@ -92,13 +93,35 @@ class Qwen3CtcEngine:
         if self.cfg.use_gpu and "CUDAExecutionProvider" in ort.get_available_providers():
             providers.insert(0, "CUDAExecutionProvider")
         self._enc = ort.InferenceSession(self.cfg.encoder_onnx_path, providers=providers)
-        self._ctc = ort.InferenceSession(self.cfg.ctc_onnx_path, providers=providers)
+        self._ctc = self._ctc_session(self.cfg.ctc_onnx_path, providers, self.cfg.ctc_argmax_in_graph)
         self._fe = WhisperFeatureExtractor.from_pretrained(self.cfg.preprocessor_path)
         self.id2bytes = load_tokens(self.cfg.tokens_path)
         self._np = np
         return self
 
     # ── 内部 ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _ctc_session(path, providers, argmax_in_graph=True):
+        """加载 CTC 头；argmax_in_graph 时在图末尾追加 ArgMax，只回传 int64 的帧级 id。
+
+        logits [1, 390, 72468] float32 在 30 秒音频上是 113MB，每次都从显存拷回主机再 numpy argmax，
+        CTC 头这段要 ~19ms；ArgMax 进图后 ~8ms，逐帧结果一致（5070 Ti，CUDA EP）。
+        已经是 int64 输出的模型（比如 CapsWriter 那种把 argmax 导进图的）原样加载。
+        """
+        import onnxruntime as ort
+        if not argmax_in_graph:
+            return ort.InferenceSession(path, providers=providers)
+        import onnx
+        from onnx import TensorProto, helper
+        m = onnx.load(path)                       # 外置 .onnx.data 会一并读进来，序列化后不再依赖路径
+        out = m.graph.output[0]
+        if out.type.tensor_type.elem_type == TensorProto.INT64:
+            return ort.InferenceSession(path, providers=providers)
+        m.graph.node.append(helper.make_node("ArgMax", [out.name], ["indices"], axis=-1, keepdims=0))
+        del m.graph.output[:]
+        m.graph.output.append(helper.make_tensor_value_info("indices", TensorProto.INT64, ["batch", "time"]))
+        return ort.InferenceSession(m.SerializeToString(), providers=providers)
+
     @staticmethod
     def _valid_frames(mel_len: int) -> int:
         """真实 mel 帧数 -> 编码器有效输出帧数（每 100 帧出 13 帧）。"""
@@ -120,8 +143,8 @@ class Qwen3CtcEngine:
     def ctc_tokens(self, audio_embd):
         """embedding -> [(紧凑 id, 帧)]，贪心折叠、去 blank/unk。"""
         np = self._np
-        logits = self._ctc.run(None, {"enc_output": audio_embd[None]})[0]
-        ids = np.argmax(logits[0], axis=-1)
+        out = self._ctc.run(None, {"enc_output": audio_embd[None]})[0]
+        ids = out[0] if out.dtype == np.int64 else np.argmax(out[0], axis=-1)   # 图里已 ArgMax 则直接是 id
         out, prev = [], None
         for frame, tok in enumerate(ids):
             tok = int(tok)

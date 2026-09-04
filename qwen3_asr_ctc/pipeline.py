@@ -166,9 +166,12 @@ class Qwen3Pipeline:
         if audio is None or len(audio) < 1600:
             return DecodeResult(timings=T)
 
+        logger.info(f"[音频] n={len(audio)} sr={stream.sample_rate} dtype={audio.dtype} absmax={float(np.abs(audio).max()):.4f} "
+                    f"writable={audio.flags.writeable}")
         t0 = time.perf_counter()
         audio_embd = self.ctc.encode(audio)
         T.encode = time.perf_counter() - t0
+        logger.info(f"[编码] audio_embd={audio_embd.shape} absmax={float(np.abs(audio_embd).max()):.3f}")
 
         t0 = time.perf_counter()
         if self.cfg.enable_ctc or self.model is None:
