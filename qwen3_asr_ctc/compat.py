@@ -19,14 +19,19 @@ if _src and os.path.isdir(_src) and _src not in sys.path:
 import torch
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-if "default" not in ROPE_INIT_FUNCTIONS:
-    def _default_rope(config, device=None):
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        inv_freq = 1.0 / (
-            config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
-        )
-        return inv_freq, 1.0
+# _default_rope 必须无条件定义：下面第 42 行那句给
+# Qwen3ASRThinkerTextRotaryEmbedding 打补丁时也要用它。原来它嵌在
+# `if "default" not in ROPE_INIT_FUNCTIONS:` 里，transformers 4.57.6 自带
+# "default"，于是分支不进、函数从未被定义，到下面直接 NameError。
+def _default_rope(config, device=None):
+    dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    inv_freq = 1.0 / (
+        config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
+    )
+    return inv_freq, 1.0
 
+
+if "default" not in ROPE_INIT_FUNCTIONS:
     ROPE_INIT_FUNCTIONS["default"] = _default_rope
 
 from qwen_asr.core.transformers_backend import configuration_qwen3_asr as _qcfg
