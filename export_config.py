@@ -30,7 +30,9 @@ CONVERT_HF_TO_GGUF = LLAMA_CPP / "convert_hf_to_gguf.py"
 LLAMA_QUANTIZE = LLAMA_CPP / "build" / "bin" / "llama-quantize"
 
 # ── 输出 ───────────────────────────────────────────────────────────────
-MODEL_DIR = HERE / "model"
+# 每一轮导到自己的目录，别覆盖已经发出去的 model/。编码器和 decoder 的
+# onnx/gguf 跨轮不变，新目录里软链过去就行（省 20 分钟和 3.3 GB）。
+MODEL_DIR = Path(os.environ.get("QWEN3_MODEL_DIR", HERE / "model"))
 PREPROC_DIR = HERE / "preprocessor"
 
 ENCODER = "Qwen3-ASR-Encoder"

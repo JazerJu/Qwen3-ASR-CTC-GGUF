@@ -109,6 +109,8 @@ def export_ctc() -> bool:
         proj_hidden=cfg["proj_hidden"], num_blocks=cfg["num_blocks"],
         num_heads=cfg["num_heads"], ffn_hidden=cfg["ffn_hidden"],
         vocab_size=cfg["vocab_size"], blank_id=cfg["blank_id"],
+        self_cond=bool(cfg.get("self_cond", False)),
+        inter_layers=tuple(cfg.get("inter_layers", (1, 3))),
     )
     sd = load_file(str(C.CTC_WEIGHTS))
     head.load_state_dict({k: v for k, v in sd.items() if not k.startswith("optimizer.")},

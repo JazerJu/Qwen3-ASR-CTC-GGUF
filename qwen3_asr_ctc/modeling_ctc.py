@@ -109,9 +109,19 @@ class TransformerBlock(nn.Module):
 
 
 class CTCDecoder(nn.Module):
+    """CTC 头。self_cond=True 时是 Self-conditioned CTC（arXiv 2104.02724）。
+
+    要点：conditioning_layer **参与推理前向**，不是训练期的辅助结构。
+    Intermediate CTC 的辅助损失只在训练时存在、推理图完全不变；自条件不是——
+    它把中间层的预测投影回主干、加到下一层的输入上。少建这条通路，权重照样
+    能加载（键都在），但输出是错的，而且错得不明显。所以 config.json 里的
+    self_cond 必须跟着权重走。
+    """
+
     def __init__(self, encoder_dim=2048, ctc_hidden=512, proj_hidden=2048,
                  num_blocks=5, num_heads=8, ffn_hidden=128,
-                 vocab_size=72468, dropout=0.0, blank_id=72466):
+                 vocab_size=72468, dropout=0.0, blank_id=72466,
+                 self_cond=False, inter_layers=(1, 3)):
         super().__init__()
         self.blank_id = blank_id
         self.linear1 = nn.Linear(encoder_dim, proj_hidden)
@@ -122,13 +132,26 @@ class CTCDecoder(nn.Module):
         ])
         self.layer_norm = nn.LayerNorm(ctc_hidden)
         self.ctc_lo = nn.Linear(ctc_hidden, vocab_size)
+        # 注入点要和训练时一致：训练里是 {i for i in (1,3) if i < num_blocks-1}，
+        # 5 层就是第 2、4 个 block 之后。ESPnet 的约束是不挂第 0 层和最后一层。
+        self.inter_layers = tuple(i for i in inter_layers if i < num_blocks - 1)
+        self.self_cond = self_cond
+        # 独立的新参数（512x72468），不是 ctc_lo 的权重绑定 —— 按 ESPnet 官方
+        # 实现来，所有注入点共享这一个。
+        self.conditioning_layer = (
+            nn.Linear(vocab_size, ctc_hidden) if self_cond else None
+        )
 
     def forward(self, encoder_out, use_blocks=True):
         x = F.gelu(self.linear1(encoder_out))
         x = F.gelu(self.linear2(x))
         if use_blocks:
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
                 x = block(x)
+                if self.self_cond and i in self.inter_layers:
+                    inter_logits = self.ctc_lo(self.layer_norm(x))
+                    x = x + self.conditioning_layer(
+                        F.softmax(inter_logits.float(), dim=-1).to(x.dtype))
         return self.ctc_lo(self.layer_norm(x))
 
 
@@ -158,6 +181,8 @@ class Qwen3CtcAsr:
             proj_hidden=self.cfg["proj_hidden"], num_blocks=self.cfg["num_blocks"],
             num_heads=self.cfg["num_heads"], ffn_hidden=self.cfg["ffn_hidden"],
             vocab_size=self.cfg["vocab_size"], dropout=0.0, blank_id=self.blank_id,
+            self_cond=bool(self.cfg.get("self_cond", False)),
+            inter_layers=tuple(self.cfg.get("inter_layers", (1, 3))),
         )
         self.head.load_state_dict(load_file(str(repo_dir / "ctc_head.safetensors")))
         self.head = self.head.to(self.device, dtype=torch.float32).eval()
