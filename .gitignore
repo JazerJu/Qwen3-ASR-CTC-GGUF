@@ -4,6 +4,10 @@ model/*.onnx.data
 model/*.gguf
 ctc/
 hf/
+# 每轮训练导到自己的目录（QWEN3_CTC_DIR / QWEN3_MODEL_DIR），
+# 上面按 model/ ctc/ 写死的规则挡不住它们。ctc-ja* + model-ja* 现在有 3.1 GB。
+ctc-*/
+model-*/
 
 # 运行产物
 *.srt
