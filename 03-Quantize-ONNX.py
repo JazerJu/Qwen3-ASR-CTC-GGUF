@@ -71,12 +71,84 @@ def gemm_to_matmul(model_path: Path, out_path: Path) -> int:
     return converted
 
 
+def inline_identity_initializers(m) -> int:
+    """把 Identity(初始化器) 直接变成同名初始化器。
+
+    torch.onnx.export 对「同一个权重被多个算子共用」的处理是插一个 Identity
+    中转；而 MatMulNBitsQuantizer 只认 B 输入直接挂初始化器的 MatMul，隔一个
+    Identity 就整个跳过，日志里只留一行 "MatMul doesn't have const weight"。
+
+    Self-conditioned CTC 正好踩这个：ctc_lo 被用 3 次（第 2、4 层的中间预测 +
+    最后一层）、conditioning_layer 2 次，而这俩恰恰是全模型最大的两个矩阵
+    （各 512x72468 = 37.1M）。不处理的话 int4 出来 327 MB，比 fp32 的 326 MB
+    还大 —— 只有第一次用的那两个被量化了，其余全留 fp32。
+
+    做法是把 Identity 的**输出名**注册成初始化器，消费方一个字都不用改。
+    """
+    g = m.graph
+    names = {i.name for i in g.initializer}
+    by_name = {i.name: i for i in g.initializer}
+    graph_outputs = {o.name for o in g.output}
+    keep, n = [], 0
+    for node in g.node:
+        if (node.op_type == "Identity"
+                and node.input[0] in names
+                and node.output[0] not in names
+                and node.output[0] not in graph_outputs):
+            cp = onnx.TensorProto()
+            cp.CopyFrom(by_name[node.input[0]])
+            cp.name = node.output[0]
+            g.initializer.append(cp)
+            names.add(cp.name)
+            n += 1
+        else:
+            keep.append(node)
+    if n:
+        del g.node[:]
+        g.node.extend(keep)
+    return n
+
+
+def dedup_initializers(m) -> int:
+    """合并内容完全相同的初始化器。
+
+    上面的 inline 会把同一个权重复制成 N 份，量化后就是 N 份一模一样的
+    int4 块（ctc_lo 一份约 19 MB，三份就是 57 MB）。量化是确定性的，
+    所以按字节去重能安全地合回一份。
+    """
+    g = m.graph
+    seen, remap = {}, {}
+    for init in g.initializer:
+        key = (init.data_type, tuple(init.dims), init.raw_data or bytes(),
+               tuple(init.float_data), tuple(init.int32_data), tuple(init.int64_data))
+        if key in seen:
+            remap[init.name] = seen[key]
+        else:
+            seen[key] = init.name
+    if not remap:
+        return 0
+    for node in g.node:
+        for i, name in enumerate(node.input):
+            if name in remap:
+                node.input[i] = remap[name]
+    kept = [i for i in g.initializer if i.name not in remap]
+    del g.initializer[:]
+    g.initializer.extend(kept)
+    return len(remap)
+
+
 def quant_int4(src: Path, dst: Path, block_size: int, symmetric: bool):
-    needs_rewrite = any(n.op_type == "Gemm" for n in onnx.load(str(src)).graph.node)
+    m = onnx.load(str(src))
+    n_ident = inline_identity_initializers(m)
+    needs_rewrite = any(n.op_type == "Gemm" for n in m.graph.node)
     target = src
+    tmp = dst.with_suffix(".pre.onnx")
+    if n_ident:
+        print(f"  [pre] inlined {n_ident} Identity(初始化器) -> 初始化器")
+        onnx.save(m, str(tmp))
+        target = tmp
     if needs_rewrite:
-        tmp = dst.with_suffix(".pre.onnx")
-        n = gemm_to_matmul(src, tmp)
+        n = gemm_to_matmul(target, tmp)
         print(f"  [pre] rewrote {n} Gemm -> MatMul+Add")
         target = tmp
     quant = MatMulNBitsQuantizer(
@@ -84,6 +156,9 @@ def quant_int4(src: Path, dst: Path, block_size: int, symmetric: bool):
         is_symmetric=symmetric, op_types_to_quantize=("MatMul",),
     )
     quant.process()
+    n_dedup = dedup_initializers(quant.model.model)
+    if n_dedup:
+        print(f"  [post] 合并 {n_dedup} 个重复初始化器")
     dst.parent.mkdir(parents=True, exist_ok=True)
     quant.model.save_model_to_file(str(dst))
     if target != src:
