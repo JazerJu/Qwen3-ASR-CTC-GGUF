@@ -24,8 +24,8 @@ LLM 解码器走 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的 GGUF。
 
 ## a7_avg5 权重更新
 
-发布状态：代码与结果已准备，HF 上传尚待发布账号登录。以下新权重链接是待上传目标，
-需上传完成后才能下载；现有 v1 / aiinfra4 文件不受影响。
+发布状态：HF 的 ONNX / PyTorch 权重、model card 和校验清单均已上传。
+新文件哈希已核验，现有 v1 / aiinfra4 文件保持不变。
 
 新头位于 [ONNX qwen-ctc-a7avg5](https://huggingface.co/JazerJu/glm-asr-ctc-bench/tree/main/qwen-ctc-a7avg5)
 和 [PyTorch a7_avg5](https://huggingface.co/JazerJu/qwen3-asr-ctc/tree/main/a7_avg5)，
