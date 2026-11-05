@@ -22,6 +22,52 @@ LLM 解码器走 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的 GGUF。
 
 ---
 
+## a7_avg5 权重更新
+
+发布状态：代码与结果已准备，HF 上传尚待发布账号登录。以下新权重链接是待上传目标，
+需上传完成后才能下载；现有 v1 / aiinfra4 文件不受影响。
+
+新头位于 [ONNX qwen-ctc-a7avg5](https://huggingface.co/JazerJu/glm-asr-ctc-bench/tree/main/qwen-ctc-a7avg5)
+和 [PyTorch a7_avg5](https://huggingface.co/JazerJu/qwen3-asr-ctc/tree/main/a7_avg5)，
+保留 v1 / aiinfra4，不覆盖旧版本。a7_avg5 是 step 412000、414000、416000、418000、
+420000 的平均，含 self-conditioning，头为 85.45M 参数；编码器、词表和 decoder 不变。
+
+已准备共享的 `model/` 后，可以只替换头，不必重导编码器或 GGUF：
+
+```bash
+hf download JazerJu/glm-asr-ctc-bench --include "qwen-ctc-a7avg5/*" --local-dir ./downloaded
+python 06-Inference.py clip.wav --precision q4 \
+  --ctc-model downloaded/qwen-ctc-a7avg5/Qwen3-ASR-CTC.hqqf16.onnx
+```
+
+`--ctc-model` 指定独立头文件；`--precision` 仍控制共享编码器，decoder 路径不变。
+若模型都在 `model/` 下，也可用 `--ctc-precision hqqf16`。
+HQQ int4 + fp16 激活是当前部署选项，原来的 RTN q4/q4f16 也保留。
+DirectML 必须用无 MatMulNBits 的 fp16 图，尚未在真实 Windows 核显上验收。
+
+中文 17 段回归集的 a7_avg5 HQQ CER 为 14.96%（a6_avg5 为 16.20%），英文 6 段
+为 5.98%（6.68%）。这是对 v1+LLM 伪参考的逐视频宏平均，不是人工真值成绩；
+TED 集有训练重叠，且仍有少量 CTC 汉字残留。
+[评测原始结果与完整口径](https://github.com/JazerJu/bench-asr-ctc/blob/main/docs/a7_avg5.md)。
+下文原有表格是历史版本的成绩，不代表 a7_avg5 已重跑对应测试。
+
+### 从 PyTorch 头重新导出 a7_avg5
+
+```bash
+hf download JazerJu/qwen3-asr-ctc --include "a7_avg5/*" --local-dir ./downloaded-ctc
+# export_ctc_only.py 按 ctc-<name>/ 查找输入：
+cp -a downloaded-ctc/a7_avg5 ./ctc-a7avg5
+python export_ctc_only.py a7avg5 --method hqq
+
+# 如还需要 RTN，保留共享编码器，只量化同一个头：
+QWEN3_MODEL_DIR="$PWD/model-a7avg5" python 03-Quantize-ONNX.py --only-ctc --method rtn
+```
+
+`export_ctc_only.py` 现在从所在仓库定位路径，不依赖作者的 `/data/...` 目录。
+`--bench-dir /path/to/bench-asr-ctc` 可选建立评测用软链，默认不改其他仓库。
+`config.json` 的 `global_step=412000` 是平均列表首点，`val_loss=0.0` 是历史导出占位值，
+不是“验证损失为零”；完整平均列表和文件校验见 HF 的 `release.json`。
+
 ## 快速开始
 
 ### 1. 安装依赖
@@ -78,13 +124,16 @@ python 08-Gate-Int4.py               # int4 链 vs fp32 链，贪心文本差异
 
 默认两遍：CTC 首遍出词级时间戳和热词候选，LLM 二遍（q5_k_m GGUF）出最终文本，再用 NW 把 CTC 的时间戳对到 LLM 文本上。不给 `decoder_gguf_path` 就只跑 CTC 首遍。
 
-**精度怎么选**：N 卡走 CUDA EP 用 **fp16**——q4 的 `MatMulNBits` 是给 DirectML / 核显省显存的，在 CUDA EP 上反而比 fp16 慢一倍（5070 Ti 上 encoder 21.8 vs 10.1ms）。显存紧的 N 卡用 **q4f16**（int4 权重 + fp16 激活，`03-Quantize-ONNX.py` 顺带产出）：速度和 fp16 一样（encoder 10.6 vs 10.1ms），体积只有 1/4（164MB vs 606MB），CTC 帧级输出与 q4 完全一致。原来的 q4（fp32 激活）只剩 CPU EP 一个用处；Windows DML 跑不了 `MatMulNBits`，只能用 fp16。CTC 头加载时会在图末尾追加 ArgMax，只回传帧级 id（省掉 30 秒 113MB 的 logits 回传，19 → 8ms），`ctc_argmax_in_graph=False` 可关。
+**精度怎么选**：N 卡可用 **fp16**，显存紧时可用 **q4f16**（RTN int4 权重 + fp16 激活）；
+a7_avg5 另提供 **hqqf16** 头。Windows DirectML 应用 **fp16**，不能使用含
+`MatMulNBits` 的 q4/HQQ 图。量化和激活精度都可能改变输出，不保证 q4 与 q4f16
+逐帧相同。CTC 头加载时会在图末尾追加 ArgMax，只回传帧级 id，`ctc_argmax_in_graph=False` 可关。
 
 ```python
 from qwen3_asr_ctc import create_asr_engine
 
 engine = create_asr_engine(
-    encoder_onnx_path="model/Qwen3-ASR-Encoder.fp16.onnx",   # CUDA 用 fp16；DML/核显用 q4
+    encoder_onnx_path="model/Qwen3-ASR-Encoder.fp16.onnx",   # CUDA 或 DirectML 的 fp16 图
     ctc_onnx_path="model/Qwen3-ASR-CTC.fp16.onnx",
     tokens_path="model/tokens.txt",
     preprocessor_path="preprocessor",

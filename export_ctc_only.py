@@ -6,15 +6,13 @@
 和 03 的 quant_int4() / to_fp16()。
     python export_ctc_only.py aiinfra2
 """
-import importlib.util, json, os, sys
+import argparse
+import importlib.util
+import os
+import sys
 from pathlib import Path
 
-name = sys.argv[1]
-HERE = Path("/data/推理框架/asr-onnx/Qwen3-ASR-CTC-GGUF")
-BENCH = Path("/data/推理框架/asr-onnx/bench-asr-ctc/models")
-os.environ["QWEN3_CTC_DIR"] = str(HERE / ("ctc-" + name))
-os.environ["QWEN3_MODEL_DIR"] = str(HERE / ("model-" + name))
-sys.path.insert(0, str(HERE)); os.chdir(HERE)
+HERE = Path(__file__).resolve().parent
 
 
 def load(fn, mod):
@@ -23,32 +21,49 @@ def load(fn, mod):
     return m
 
 
-e1 = load("01-Export-ONNX-FP32.py", "exp01")
-C = e1.C
-assert str(C.MODEL_DIR).endswith("model-" + name) and str(C.CTC_DIR).endswith("ctc-" + name), (C.MODEL_DIR, C.CTC_DIR)
-C.MODEL_DIR.mkdir(parents=True, exist_ok=True)
-ok = e1.export_ctc()
-print("CTC 一致性门:", "PASS" if ok else "FAIL")
-if not ok:
-    sys.exit(1)
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("name", help="round name: ctc-<name>/ -> model-<name>/")
+    ap.add_argument("--method", choices=["rtn", "hqq"], default="rtn")
+    ap.add_argument("--bench-dir", type=Path, help="optionally link into <bench-dir>/models/")
+    args = ap.parse_args()
+    if Path(args.name).name != args.name or args.name in (".", ".."):
+        ap.error("name must be a single directory component")
+    os.environ["QWEN3_CTC_DIR"] = str(HERE / ("ctc-" + args.name))
+    os.environ["QWEN3_MODEL_DIR"] = str(HERE / ("model-" + args.name))
+    sys.path.insert(0, str(HERE))
 
-q3 = load("03-Quantize-ONNX.py", "exp03")
-fp32 = C.onnx(C.CTC, "fp32")
-q3.quant_int4(fp32, C.onnx(C.CTC, "q4"), 128, False)
-q3.to_fp16(fp32, C.onnx(C.CTC, "fp16"))
+    e1 = load("01-Export-ONNX-FP32.py", "exp01")
+    C = e1.C
+    C.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    ok = e1.export_ctc()
+    print("GATE:", "PASS" if ok else "FAIL", "(CTC ONNX vs PyTorch)")
+    if not ok:
+        return 1
+    q3 = load("03-Quantize-ONNX.py", "exp03")
+    tag = "hqq" if args.method == "hqq" else "q4"
+    fp32 = C.onnx(C.CTC, "fp32")
+    q3.quant_int4(fp32, C.onnx(C.CTC, tag), 128, False, method=args.method)
+    q3.to_fp16(fp32, C.onnx(C.CTC, "fp16"))
+    q3.to_q4f16(C.onnx(C.CTC, tag), C.onnx(C.CTC, tag + "f16"))
 
-for f in ["Qwen3-ASR-Decoder.q5_k_m.gguf", "Qwen3-ASR-Encoder.fp16.onnx", "Qwen3-ASR-Encoder.q4.onnx", "tokens.txt"]:
-    link = C.MODEL_DIR / f
-    if not link.exists():
-        link.symlink_to(Path("..") / "model" / f)
+    for f in ["Qwen3-ASR-Decoder.q5_k_m.gguf", "Qwen3-ASR-Encoder.fp16.onnx",
+              "Qwen3-ASR-Encoder.q4.onnx", "tokens.txt"]:
+        link = C.MODEL_DIR / f
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to(Path("..") / "model" / f)
 
-b = BENCH / ("qwen-ctc-" + name)
-b.mkdir(parents=True, exist_ok=True)
-for prec in ["fp16", "q4"]:
-    link = b / ("Qwen3-ASR-CTC.%s.onnx" % prec)
-    if not link.exists():
-        link.symlink_to(C.onnx(C.CTC, prec))
-(b / "config.json").write_text((C.CTC_DIR / "config.json").read_text(encoding="utf-8"), encoding="utf-8")
-for p in sorted(C.MODEL_DIR.iterdir()) + sorted(b.iterdir()):
-    print("  %-40s %s" % (p.name, ("-> " + os.readlink(p)) if p.is_symlink() else "%.1f MB" % (p.stat().st_size / 1e6)))
-print("EXPORT_DONE", name)
+    if args.bench_dir:
+        b = args.bench_dir.resolve() / "models" / ("qwen-ctc-" + args.name)
+        b.mkdir(parents=True, exist_ok=True)
+        for prec in ("fp16", tag, tag + "f16"):
+            link = b / f"Qwen3-ASR-CTC.{prec}.onnx"
+            if not link.exists() and not link.is_symlink():
+                link.symlink_to(C.onnx(C.CTC, prec))
+        (b / "config.json").write_text(C.CTC_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    print("EXPORT_DONE", args.name)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

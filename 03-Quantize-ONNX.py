@@ -19,6 +19,7 @@ import numpy as np
 import onnx
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
 from onnxruntime.transformers.float16 import convert_float_to_float16
+from onnxruntime.transformers.onnx_model import OnnxModel
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -137,7 +138,12 @@ def dedup_initializers(m) -> int:
     return len(remap)
 
 
-def quant_int4(src: Path, dst: Path, block_size: int, symmetric: bool):
+def quant_int4(src: Path, dst: Path, block_size: int, symmetric: bool, method: str = "rtn"):
+    if method not in ("rtn", "hqq"):
+        raise ValueError(f"unknown quantization method: {method}")
+    if method == "hqq" and symmetric:
+        raise ValueError("--symmetric is only supported with RTN")
+    dst.parent.mkdir(parents=True, exist_ok=True)
     m = onnx.load(str(src))
     n_ident = inline_identity_initializers(m)
     needs_rewrite = any(n.op_type == "Gemm" for n in m.graph.node)
@@ -151,10 +157,20 @@ def quant_int4(src: Path, dst: Path, block_size: int, symmetric: bool):
         n = gemm_to_matmul(target, tmp)
         print(f"  [pre] rewrote {n} Gemm -> MatMul+Add")
         target = tmp
-    quant = MatMulNBitsQuantizer(
-        model=str(target), bits=4, block_size=block_size,
-        is_symmetric=symmetric, op_types_to_quantize=("MatMul",),
-    )
+    if method == "hqq":
+        from onnxruntime.quantization.matmul_nbits_quantizer import HQQWeightOnlyQuantConfig
+
+        config = HQQWeightOnlyQuantConfig(
+            block_size=block_size, bits=4, op_types_to_quantize=("MatMul",),
+        )
+        quant = MatMulNBitsQuantizer(
+            model=str(target), algo_config=config, op_types_to_quantize=("MatMul",),
+        )
+    else:
+        quant = MatMulNBitsQuantizer(
+            model=str(target), bits=4, block_size=block_size,
+            is_symmetric=symmetric, op_types_to_quantize=("MatMul",),
+        )
     quant.process()
     n_dedup = dedup_initializers(quant.model.model)
     if n_dedup:
@@ -173,6 +189,7 @@ def to_fp16(src: Path, dst: Path):
         min_positive_val=1e-7, max_finite_val=65504,
         op_block_list=["LayerNormalization"],
     )
+    OnnxModel(model_fp16).topological_sort()
     dst.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(model_fp16, str(dst))
     print(f"  fp16 {dst.name}: {dst.stat().st_size/2**20:.1f} MiB")
@@ -184,7 +201,7 @@ def to_q4f16(q4: Path, dst: Path):
     q4 是从 fp32 图量化的，MatMulNBits 的激活是 fp32，CUDA EP 上走不带 tensor core 的 fp32 GEMM，
     比 fp16 慢一倍（5070 Ti 上 Qwen encoder 21.9 vs 9.7ms，GLM 105 vs 50ms）。MatMulNBits 本身不慢
     ——单算子 A=fp16 时 2.81ms，fp16 MatMul 2.77ms。把激活和 scale 转成 fp16，速度就和 fp16 一样，
-    体积约 fp16 的 1/4，帧级 CTC 输出与 q4 完全一致。DML 跑不了 MatMulNBits，那边仍用 fp16。
+    体积约 fp16 的 1/4；激活精度变化仍需回归测试。DML 跑不了 MatMulNBits，那边仍用 fp16。
     """
     model = onnx.load(str(q4))
     m16 = convert_float_to_float16(
@@ -192,6 +209,8 @@ def to_q4f16(q4: Path, dst: Path):
         min_positive_val=1e-7, max_finite_val=65504,
         disable_shape_infer=True,   # 不 block LayerNormalization：和 disable_shape_infer 一起用会让 LN 的输入/权重类型不一致，CUDA 的 fp16 LN 内部本就 fp32 累加
     )
+    # Cast insertion may append producers after their consumers.
+    OnnxModel(m16).topological_sort()
     dst.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(m16, str(dst))
     print(f"  q4f16 {dst.name}: {dst.stat().st_size/2**20:.1f} MiB")
@@ -200,24 +219,32 @@ def to_q4f16(q4: Path, dst: Path):
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--block-size", type=int, default=128)
+    p.add_argument("--method", choices=["rtn", "hqq"], default="rtn",
+                   help="RTN -> q4/q4f16; HQQ -> hqq/hqqf16 (CTC a7 deployment)")
+    p.add_argument("--only-ctc", action="store_true", help="leave the shared encoder unchanged")
     p.add_argument("--symmetric", action="store_true")
     p.add_argument("--skip-int4", action="store_true")
     p.add_argument("--skip-fp16", action="store_true")
     p.add_argument("--skip-q4f16", action="store_true")
     args = p.parse_args()
+    if args.method == "hqq" and args.symmetric:
+        p.error("--symmetric is only supported with --method rtn")
 
-    for stem in ("Qwen3-ASR-CTC", "Qwen3-ASR-Encoder"):
+    tag = "hqq" if args.method == "hqq" else "q4"
+    stems = ("Qwen3-ASR-CTC",) if args.only_ctc else ("Qwen3-ASR-CTC", "Qwen3-ASR-Encoder")
+    for stem in stems:
         fp32 = MODEL / f"{stem}.fp32.onnx"
         if not fp32.exists():
             print(f"skip missing {stem}.fp32")
             continue
         print(stem)
         if not args.skip_int4:
-            quant_int4(fp32, MODEL / f"{stem}.q4.onnx", args.block_size, args.symmetric)
+            quant_int4(fp32, MODEL / f"{stem}.{tag}.onnx",
+                       args.block_size, args.symmetric, method=args.method)
         if not args.skip_fp16:
             to_fp16(fp32, MODEL / f"{stem}.fp16.onnx")
-        if not args.skip_q4f16 and (MODEL / f"{stem}.q4.onnx").exists():
-            to_q4f16(MODEL / f"{stem}.q4.onnx", MODEL / f"{stem}.q4f16.onnx")
+        if not args.skip_q4f16 and (MODEL / f"{stem}.{tag}.onnx").exists():
+            to_q4f16(MODEL / f"{stem}.{tag}.onnx", MODEL / f"{stem}.{tag}f16.onnx")
     return 0
 
 

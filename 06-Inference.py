@@ -28,8 +28,11 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("audio", nargs="?", default=str(HERE / "input.mp3"),
                     help="输入音频/视频，任意 ffmpeg 格式（默认 input.mp3）")
-    ap.add_argument("--precision", default="q4", choices=["fp32", "fp16", "q4"],
+    ap.add_argument("--precision", default="q4", choices=["fp32", "fp16", "q4", "q4f16"],
                     help="用哪一档 ONNX（默认 q4）")
+    ap.add_argument("--ctc-precision", choices=["fp32", "fp16", "q4", "q4f16", "hqq", "hqqf16"],
+                    help="CTC-only precision override; encoder keeps --precision")
+    ap.add_argument("--ctc-model", type=Path, help="use a downloaded CTC head without moving the shared models")
     ap.add_argument("--srt", default=None, help="写出词级时间戳 SRT")
     ap.add_argument("--cpu", action="store_true", help="强制 CPU（ONNX 和 llama 都不用 GPU）")
     ap.add_argument("--no-decoder", action="store_true", help="只跑 CTC 首遍")
@@ -48,7 +51,7 @@ def main() -> int:
         return 1
 
     enc = C.onnx(C.ENCODER, args.precision)
-    ctc = C.onnx(C.CTC, args.precision)
+    ctc = args.ctc_model or C.onnx(C.CTC, args.ctc_precision or args.precision)
     for p in (enc, ctc, C.TOKENS_TXT):
         if not p.exists():
             print(f"缺少 {p.name}，先跑 01–03 步", file=sys.stderr)
