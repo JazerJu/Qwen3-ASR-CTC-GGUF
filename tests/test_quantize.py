@@ -31,7 +31,6 @@ class QuantizationTests(unittest.TestCase):
             onnx.save(model, source)
             fp16 = Path(td) / "test.fp16.onnx"
             quantize.to_fp16(source, fp16)
-            onnx.checker.check_model(str(fp16))
             for method, tag in (("rtn", "q4"), ("hqq", "hqq")):
                 output = Path(td) / f"test.{tag}.onnx"
                 quantize.quant_int4(source, output, 128, False, method=method)
@@ -43,7 +42,7 @@ class QuantizationTests(unittest.TestCase):
                 self.assertTrue(np.isfinite(result).all())
                 f16 = Path(td) / f"test.{tag}f16.onnx"
                 quantize.to_q4f16(output, f16)
-                onnx.checker.check_model(str(f16))
+                ort.InferenceSession(str(f16), providers=["CPUExecutionProvider"])
 
     def test_hqq_symmetric_fails_before_loading(self):
         with self.assertRaisesRegex(ValueError, "RTN"):

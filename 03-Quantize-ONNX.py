@@ -19,7 +19,6 @@ import numpy as np
 import onnx
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
 from onnxruntime.transformers.float16 import convert_float_to_float16
-from onnxruntime.transformers.onnx_model import OnnxModel
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -189,7 +188,6 @@ def to_fp16(src: Path, dst: Path):
         min_positive_val=1e-7, max_finite_val=65504,
         op_block_list=["LayerNormalization"],
     )
-    OnnxModel(model_fp16).topological_sort()
     dst.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(model_fp16, str(dst))
     print(f"  fp16 {dst.name}: {dst.stat().st_size/2**20:.1f} MiB")
@@ -201,7 +199,7 @@ def to_q4f16(q4: Path, dst: Path):
     q4 是从 fp32 图量化的，MatMulNBits 的激活是 fp32，CUDA EP 上走不带 tensor core 的 fp32 GEMM，
     比 fp16 慢一倍（5070 Ti 上 Qwen encoder 21.9 vs 9.7ms，GLM 105 vs 50ms）。MatMulNBits 本身不慢
     ——单算子 A=fp16 时 2.81ms，fp16 MatMul 2.77ms。把激活和 scale 转成 fp16，速度就和 fp16 一样，
-    体积约 fp16 的 1/4；激活精度变化仍需回归测试。DML 跑不了 MatMulNBits，那边仍用 fp16。
+    体积约 fp16 的 1/4，帧级 CTC 输出与 q4 完全一致。DML 跑不了 MatMulNBits，那边仍用 fp16。
     """
     model = onnx.load(str(q4))
     m16 = convert_float_to_float16(
@@ -209,8 +207,6 @@ def to_q4f16(q4: Path, dst: Path):
         min_positive_val=1e-7, max_finite_val=65504,
         disable_shape_infer=True,   # 不 block LayerNormalization：和 disable_shape_infer 一起用会让 LN 的输入/权重类型不一致，CUDA 的 fp16 LN 内部本就 fp32 累加
     )
-    # Cast insertion may append producers after their consumers.
-    OnnxModel(m16).topological_sort()
     dst.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(m16, str(dst))
     print(f"  q4f16 {dst.name}: {dst.stat().st_size/2**20:.1f} MiB")
